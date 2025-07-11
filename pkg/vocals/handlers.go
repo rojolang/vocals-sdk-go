@@ -26,6 +26,7 @@ func CreateLoggingMessageHandler(verbose bool) MessageHandler {
 func CreateTranscriptionHandler(callback func(string, bool)) MessageHandler {
 	return func(msg *WebSocketResponse) {
 		if msg.Type == nil {
+			log.Printf("Transcription handler: message type is nil")
 			return
 		}
 
@@ -35,19 +36,19 @@ func CreateTranscriptionHandler(callback func(string, bool)) MessageHandler {
 
 		data, ok := msg.Data.(map[string]interface{})
 		if !ok {
-			log.Println("Invalid transcription data")
+			log.Printf("Invalid transcription data: expected map[string]interface{}, got %T", msg.Data)
 			return
 		}
 
 		text := getString(data, "text")
 		if text == "" {
-			log.Println("Empty transcription text")
+			log.Printf("Empty transcription text in message data: %+v", data)
 			return
 		}
 
 		isFinal := false
 		if _, exists := data["is_final"]; exists {
-			isFinal = getBoolUtil(data, "is_final")
+			isFinal = getBool(data, "is_final")
 		}
 
 		callback(text, isFinal)
@@ -62,20 +63,20 @@ func CreateTTSHandler(callback func(TTSAudioSegment)) MessageHandler {
 
 		data, ok := msg.Data.(map[string]interface{})
 		if !ok {
-			log.Println("Invalid TTS data")
+			log.Printf("Invalid TTS data: expected map[string]interface{}, got %T", msg.Data)
 			return
 		}
 
 		segmentID := getString(data, "segment_id")
 		if segmentID == "" {
-			log.Println("Invalid TTS segment ID")
+			log.Printf("Invalid TTS segment ID in message data: %+v", data)
 			return
 		}
 
 		sentenceNumber := getInt(data, "sentence_number")
 		audioData := getString(data, "audio_data")
 		if audioData == "" {
-			log.Println("Invalid TTS audio data")
+			log.Printf("Invalid TTS audio data in message data: %+v", data)
 			return
 		}
 

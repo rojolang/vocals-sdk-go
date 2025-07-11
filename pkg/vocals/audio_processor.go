@@ -178,8 +178,34 @@ func (ap *AudioProcessor) playNextSegment() {
 		samples[i] = math.Float32frombits(bits)
 	}
 
-	// Open playback stream
-	stream, err := portaudio.OpenDefaultStream(0, ap.config.Channels, float64(segment.SampleRate), ap.config.BufferSize, nil)
+	// Create a channel to signal when playback is complete
+	done := make(chan bool, 1)
+	sampleIndex := 0
+	var mu sync.Mutex
+	
+	// Open playback stream with callback that feeds audio data
+	stream, err := portaudio.OpenDefaultStream(0, ap.config.Channels, float64(segment.SampleRate), ap.config.BufferSize, func(out []float32) {
+		mu.Lock()
+		defer mu.Unlock()
+		
+		// Copy samples to output buffer
+		for i := range out {
+			if sampleIndex < len(samples) {
+				out[i] = samples[sampleIndex]
+				sampleIndex++
+			} else {
+				out[i] = 0.0 // Silence when no more samples
+			}
+		}
+		
+		// Signal completion when all samples have been output
+		if sampleIndex >= len(samples) {
+			select {
+			case done <- true:
+			default:
+			}
+		}
+	})
 	if err != nil {
 		ap.handleError(NewVocalsError(fmt.Sprintf("Failed to open playback stream: %v", err), "PLAYBACK_OPEN_ERROR"))
 		ap.mu.Lock()
@@ -201,13 +227,15 @@ func (ap *AudioProcessor) playNextSegment() {
 		return
 	}
 
-	// For playback in portaudio, we need to use a callback-based approach
-	// This is a simplified implementation - in practice, you'd need to properly handle the callback
 	log.Printf("Playing audio segment with %d samples", len(samples))
 	
-	// Simulate playback duration
-	duration := float64(len(samples)) / float64(ap.config.SampleRate)
-	time.Sleep(time.Duration(duration * float64(time.Second)))
+	// Wait for playback to complete or timeout
+	select {
+	case <-done:
+		log.Printf("Audio playback completed")
+	case <-time.After(time.Duration(float64(len(samples))/float64(segment.SampleRate)*1.5) * time.Second):
+		log.Printf("Audio playback timeout")
+	}
 
 	if err := stream.Stop(); err != nil {
 		ap.handleError(NewVocalsError(fmt.Sprintf("Failed to stop playback stream: %v", err), "PLAYBACK_STOP_ERROR"))

@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
-	"log"
 	"math"
 	"sync"
 	"time"
@@ -25,6 +24,7 @@ type VocalsClient struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
 	mu                 sync.Mutex
+	logger             *VocalsLogger
 }
 
 func NewVocalsClient(config *VocalsConfig, audioConfig *AudioConfig, userID *string, modes []string) *VocalsClient {
@@ -52,6 +52,7 @@ func NewVocalsClient(config *VocalsConfig, audioConfig *AudioConfig, userID *str
 		audioDataHandlers:  []AudioDataHandler{},
 		ctx:                ctx,
 		cancel:             cancel,
+		logger:             GetGlobalLogger().WithComponent("VocalsClient"),
 	}
 
 	client.setupInternalHandlers()
@@ -63,7 +64,7 @@ func NewVocalsClient(config *VocalsConfig, audioConfig *AudioConfig, userID *str
 	if config.AutoConnect {
 		go func() {
 			if err := client.Connect(); err != nil {
-				log.Printf("Auto-connect failed: %v", err)
+				client.logger.WithError(err).Error("Auto-connect failed")
 			}
 		}()
 	}
@@ -76,15 +77,29 @@ func (c *VocalsClient) setupInternalHandlers() {
 		// Internal processing, e.g., add TTS to queue
 		if msg.Type != nil && *msg.Type == "tts_audio" {
 			if data, ok := msg.Data.(map[string]interface{}); ok {
+				// Validate required fields before processing
+				segmentID := getString(data, "segment_id")
+				audioData := getString(data, "audio_data")
+
+				if segmentID == "" || audioData == "" {
+					c.logger.WithFields(map[string]interface{}{
+						"segment_id": segmentID,
+						"audio_data_empty": audioData == "",
+					}).Error("Invalid TTS message: missing required fields")
+					return
+				}
+
 				segment := TTSAudioSegment{
-					SegmentID:      getString(data, "segment_id"),
+					SegmentID:      segmentID,
 					SentenceNumber: getInt(data, "sentence_number"),
-					AudioData:      getString(data, "audio_data"),
+					AudioData:      audioData,
 					SampleRate:     getInt(data, "sample_rate"),
 					Text:           getString(data, "text"),
 					Format:         getString(data, "format"),
 				}
 				c.audioProcessor.AddToQueue(segment)
+			} else {
+				c.logger.WithField("data_type", fmt.Sprintf("%T", msg.Data)).Error("Invalid TTS message format: expected map[string]interface{}")
 			}
 		}
 		// Handle other types internally
@@ -129,7 +144,7 @@ func (c *VocalsClient) StartRecording() error {
 		}
 		err := c.websocketClient.SendMessage(msg)
 		if err != nil {
-			log.Printf("Error sending audio data: %v", err)
+			c.logger.WithError(err).Error("Error sending audio data")
 			return
 		}
 	})
@@ -145,6 +160,177 @@ func (c *VocalsClient) StreamMicrophone(duration float64) error {
 	}
 	time.Sleep(time.Duration(duration * float64(time.Second)))
 	return c.StopRecording()
+}
+
+// StreamMicrophoneWithStats provides enhanced streaming with comprehensive monitoring
+func (c *VocalsClient) StreamMicrophoneWithStats(
+	duration float64,
+	statsCallback StreamStatsCallback,
+	audioLevelCallback AudioLevelCallback,
+	silenceThreshold float32,
+	silenceDetectionCallback SilenceDetectionCallback,
+) (*StreamStats, error) {
+	// Initialize statistics
+	stats := &StreamStats{
+		StartTime:          time.Now(),
+		MinAmplitude:       float32(math.Inf(1)), // Initialize to positive infinity
+		VoiceActivityRatio: 0.0,
+	}
+
+	// Setup audio level monitoring
+	var totalAmplitude float64
+	var silenceStartTime time.Time
+	var totalSilenceDuration time.Duration
+	var voiceActivityDuration time.Duration
+	var mu sync.Mutex
+
+	// Create audio data handler for statistics
+	audioHandler := func(data []float32) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		if len(data) == 0 {
+			return
+		}
+
+		// Update sample and byte counts
+		stats.TotalSamples += int64(len(data))
+		stats.TotalBytes += int64(len(data) * 4) // float32 = 4 bytes
+
+		// Calculate amplitude metrics
+		var sum float64
+		var maxAmp float32
+		var minAmp float32 = float32(math.Inf(1))
+
+		for _, sample := range data {
+			abs := float32(math.Abs(float64(sample)))
+			sum += float64(abs)
+
+			if abs > maxAmp {
+				maxAmp = abs
+			}
+			if abs < minAmp {
+				minAmp = abs
+			}
+		}
+
+		avgAmp := float32(sum / float64(len(data)))
+		rms := float32(math.Sqrt(sum / float64(len(data))))
+
+		// Update global statistics
+		totalAmplitude += sum
+		if maxAmp > stats.MaxAmplitude {
+			stats.MaxAmplitude = maxAmp
+		}
+		if minAmp < stats.MinAmplitude {
+			stats.MinAmplitude = minAmp
+		}
+		stats.RMSAmplitude = rms
+
+		// Voice activity detection
+		if avgAmp > silenceThreshold {
+			if !silenceStartTime.IsZero() {
+				silenceDuration := time.Since(silenceStartTime)
+				totalSilenceDuration += silenceDuration
+				if silenceDetectionCallback != nil {
+					go silenceDetectionCallback(silenceDuration)
+				}
+				silenceStartTime = time.Time{}
+			}
+			voiceActivityDuration += time.Duration(float64(len(data)) / float64(c.audioConfig.SampleRate) * float64(time.Second))
+		} else {
+			if silenceStartTime.IsZero() {
+				silenceStartTime = time.Now()
+			}
+		}
+
+		// Call real-time audio level callback
+		if audioLevelCallback != nil {
+			go audioLevelCallback(avgAmp, maxAmp)
+		}
+
+		// Update and call stats callback
+		stats.Duration = time.Since(stats.StartTime)
+		if stats.TotalSamples > 0 {
+			stats.AverageAmplitude = float32(totalAmplitude / float64(stats.TotalSamples))
+		}
+		stats.SilenceDuration = totalSilenceDuration
+		if stats.Duration > 0 {
+			stats.VoiceActivityRatio = float32(voiceActivityDuration.Seconds() / stats.Duration.Seconds())
+		}
+
+		if statsCallback != nil {
+			go statsCallback(stats)
+		}
+	}
+
+	// Add the audio handler
+	removeHandler := c.AddAudioDataHandler(audioHandler)
+	defer removeHandler()
+
+	// Start recording
+	if err := c.StartRecording(); err != nil {
+		return nil, err
+	}
+
+	// Monitor for the specified duration
+	time.Sleep(time.Duration(duration * float64(time.Second)))
+
+	// Stop recording
+	if err := c.StopRecording(); err != nil {
+		return stats, err
+	}
+
+	// Finalize statistics
+	mu.Lock()
+	stats.EndTime = time.Now()
+	stats.Duration = stats.EndTime.Sub(stats.StartTime)
+
+	// Handle final silence period
+	if !silenceStartTime.IsZero() {
+		finalSilenceDuration := time.Since(silenceStartTime)
+		stats.SilenceDuration += finalSilenceDuration
+	}
+
+	// Calculate final voice activity ratio
+	if stats.Duration > 0 {
+		stats.VoiceActivityRatio = float32(voiceActivityDuration.Seconds() / stats.Duration.Seconds())
+	}
+	mu.Unlock()
+
+	return stats, nil
+}
+
+// StreamMicrophoneWithBasicStats provides enhanced streaming with basic statistics and logging
+func (c *VocalsClient) StreamMicrophoneWithBasicStats(duration float64, silenceThreshold float32, verbose bool) (*StreamStats, error) {
+	var statsCallback StreamStatsCallback
+	var audioLevelCallback AudioLevelCallback
+	var silenceDetectionCallback SilenceDetectionCallback
+
+	if verbose {
+		statsCallback = func(stats *StreamStats) {
+			c.logger.WithFields(map[string]interface{}{
+				"duration": stats.Duration.Seconds(),
+				"samples": stats.TotalSamples,
+				"avg_amplitude": stats.AverageAmplitude,
+				"max_amplitude": stats.MaxAmplitude,
+				"voice_activity": stats.VoiceActivityRatio * 100,
+			}).Info("Stream statistics update")
+		}
+
+		audioLevelCallback = func(avgLevel, maxLevel float32) {
+			c.logger.WithFields(map[string]interface{}{
+				"avg_level": avgLevel,
+				"max_level": maxLevel,
+			}).Debug("Audio level update")
+		}
+
+		silenceDetectionCallback = func(duration time.Duration) {
+			c.logger.WithField("silence_duration", duration).Debug("Silence detected")
+		}
+	}
+
+	return c.StreamMicrophoneWithStats(duration, statsCallback, audioLevelCallback, silenceThreshold, silenceDetectionCallback)
 }
 
 func (c *VocalsClient) StreamAudioFile(filePath string) error {
@@ -221,7 +407,7 @@ func (c *VocalsClient) Cleanup() {
 	c.cancel()
 	c.audioProcessor.Cleanup()
 	c.websocketClient.Disconnect()
-	log.Println("Vocals client cleaned up")
+	c.logger.Info("Vocals client cleaned up")
 }
 
 func (c *VocalsClient) SendMessage(msg *WebSocketMessage) error {
@@ -260,12 +446,16 @@ func (c *VocalsClient) StopPlayback() error {
 	return c.audioProcessor.StopPlayback()
 }
 
-// Helper functions for type assertions
+// Helper functions for safe type assertions with error logging
 func getString(data map[string]interface{}, key string) string {
 	if val, ok := data[key]; ok {
 		if str, ok := val.(string); ok {
 			return str
 		}
+		GetGlobalLogger().WithFields(map[string]interface{}{
+			"key": key,
+			"type": fmt.Sprintf("%T", val),
+		}).Warn("Type assertion failed for key: expected string")
 	}
 	return ""
 }
@@ -278,6 +468,10 @@ func getInt(data map[string]interface{}, key string) int {
 		if num, ok := val.(int); ok {
 			return num
 		}
+		GetGlobalLogger().WithFields(map[string]interface{}{
+			"key": key,
+			"type": fmt.Sprintf("%T", val),
+		}).Warn("Type assertion failed for key: expected int or float64")
 	}
 	return 0
 }
@@ -290,8 +484,26 @@ func getFloat64(data map[string]interface{}, key string) float64 {
 		if num, ok := val.(int); ok {
 			return float64(num)
 		}
+		GetGlobalLogger().WithFields(map[string]interface{}{
+			"key": key,
+			"type": fmt.Sprintf("%T", val),
+		}).Warn("Type assertion failed for key: expected float64 or int")
 	}
 	return 0.0
+}
+
+// Helper function for safe boolean extraction
+func getBool(data map[string]interface{}, key string) bool {
+	if val, ok := data[key]; ok {
+		if b, ok := val.(bool); ok {
+			return b
+		}
+		GetGlobalLogger().WithFields(map[string]interface{}{
+			"key": key,
+			"type": fmt.Sprintf("%T", val),
+		}).Warn("Type assertion failed for key: expected bool")
+	}
+	return false
 }
 
 // Helper methods to access internal components
