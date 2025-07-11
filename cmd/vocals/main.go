@@ -152,6 +152,24 @@ func demoStatsCmd() *cobra.Command {
 
 			client := vocals.NewVocalsClient(config, audioConfig, userIDPtr, []string{})
 			
+			// Create audio handler for local storage and processing
+			audioOutputDir := "./audio_output"
+			audioHandler := vocals.NewAudioHandler(audioOutputDir, true, 100) // Save files, buffer last 100 segments
+			
+			// Set up real-time audio processing and LIVE PLAYBACK
+			audioHandler.SetProcessFunc(func(entry vocals.AudioBufferEntry) {
+				// Real-time processing - PLAY THE AUDIO LIVE!
+				fmt.Printf("\n[AUDIO PLAYBACK] 🔊 Playing segment %s (%.1fs, %d bytes)\n", 
+					entry.SegmentID, entry.DurationSeconds, len(entry.AudioData))
+				
+				// Play audio in background so we don't block processing
+				go func() {
+					if err := audioHandler.PlayAudioEntry(entry); err != nil {
+						fmt.Printf("  ⚠️  Playback error: %v\n", err)
+					}
+				}()
+			})
+			
 			// Add comprehensive handlers
 			client.AddMessageHandler(func(msg *vocals.WebSocketResponse) {
 				// Only show meaningful responses, not status messages
@@ -203,6 +221,11 @@ func demoStatsCmd() *cobra.Command {
 					fmt.Printf("\n[TTS AUDIO] \"%s\"\n", text)
 					fmt.Printf("  → Audio: %d bytes, %.1fs @ %dHz (segment: %s)\n", 
 						audioSize, duration, sampleRate, segmentID)
+					
+					// Process and save audio locally
+					if err := audioHandler.HandleTTSAudio(msg); err != nil {
+						fmt.Printf("  ⚠️  Failed to handle audio: %v\n", err)
+					}
 					
 				case "speech_interruption":
 					fmt.Printf("\n[INTERRUPTION] Speech detected - stopping current response\n")
@@ -258,6 +281,16 @@ func demoStatsCmd() *cobra.Command {
 			fmt.Printf("Quality Score: %.2f\n", stats.GetQualityScore())
 			fmt.Printf("Is Healthy: %v\n", stats.IsHealthy())
 			fmt.Println("=======================")
+			
+			// Print audio handler statistics
+			audioStats := audioHandler.GetStats()
+			fmt.Println("\n=== Audio Storage Stats ===")
+			fmt.Printf("Total TTS Segments: %d\n", audioStats.TotalSegments)
+			fmt.Printf("Buffered Segments: %d\n", audioStats.BufferedSegments)
+			fmt.Printf("Total Audio Bytes: %d\n", audioStats.TotalBytes)
+			fmt.Printf("Buffer Duration: %.2fs\n", audioStats.BufferDuration)
+			fmt.Printf("Output Directory: %s\n", audioStats.OutputDirectory)
+			fmt.Println("==========================")
 			
 			client.Cleanup()
 		},
