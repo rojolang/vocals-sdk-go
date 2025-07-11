@@ -2,9 +2,11 @@ package main
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/spf13/cobra"
 	"github.com/rojolang/vocals-sdk-go/pkg/vocals"
+	"github.com/joho/godotenv"
 )
 
 var (
@@ -65,6 +67,9 @@ func demoRecordCmd() *cobra.Command {
 			config := vocals.NewVocalsConfig()
 			audioConfig := vocals.NewAudioConfig()
 			
+			// Enable WebSocket debugging for better troubleshooting
+			config.DebugWebsocket = true
+			
 			if apiKey != "" {
 				// Set API key if provided
 				vocals.GetGlobalLogger().WithField("api_key_prefix", apiKey[:min(len(apiKey), 8)]).Info("Using API key")
@@ -113,6 +118,9 @@ func demoStatsCmd() *cobra.Command {
 
 			config := vocals.NewVocalsConfig()
 			audioConfig := vocals.NewAudioConfig()
+			
+			// Enable WebSocket debugging for better troubleshooting
+			config.DebugWebsocket = true
 			
 			if apiKey != "" {
 				vocals.GetGlobalLogger().WithField("api_key_prefix", apiKey[:min(len(apiKey), 8)]).Info("Using API key")
@@ -253,10 +261,34 @@ func setupConfigCmd() *cobra.Command {
 		Short: "Show current configuration",
 		Long:  "Display current configuration settings",
 		Run: func(cmd *cobra.Command, args []string) {
+			// Load environment variables
+			_ = godotenv.Load()
+			
+			// Get actual values from environment or flags (flags take precedence)
+			actualApiKey := apiKey
+			if actualApiKey == "" {
+				if result := vocals.GetVocalsApiKey(); result.Success {
+					actualApiKey = result.Data
+				} else {
+					// Try direct environment variable access
+					actualApiKey = os.Getenv("VOCALS_DEV_API_KEY")
+				}
+			}
+			
+			actualEndpoint := endpoint
+			if actualEndpoint == "" {
+				actualEndpoint = vocals.GetWsEndpoint()
+			}
+			
+			actualUserID := userID
+			if actualUserID == "" {
+				actualUserID = os.Getenv("USER_ID")
+			}
+			
 			fmt.Println("Current Configuration:")
-			fmt.Printf("API Key: %s\n", maskString(apiKey))
-			fmt.Printf("Endpoint: %s\n", endpoint)
-			fmt.Printf("User ID: %s\n", userID)
+			fmt.Printf("API Key: %s\n", maskString(actualApiKey))
+			fmt.Printf("Endpoint: %s\n", actualEndpoint)
+			fmt.Printf("User ID: %s\n", actualUserID)
 			fmt.Printf("Verbose: %v\n", verbose)
 			
 			// Show default configs

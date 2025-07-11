@@ -30,7 +30,7 @@ func NewVocalsConfig() *VocalsConfig {
 		MaxReconnectAttempts: 3,
 		ReconnectDelay:       1.0,
 		TokenRefreshBuffer:   60.0,
-		UseTokenAuth:         true,
+		UseTokenAuth:         true,  // Use direct API key token generation, not token endpoint
 		DebugLevel:           "INFO",
 		Headers:              make(map[string]string),
 	}
@@ -47,15 +47,14 @@ func (c *VocalsConfig) loadFromEnv() {
 
 	if endpoint := os.Getenv("VOCALS_TOKEN_ENDPOINT"); endpoint != "" {
 		c.TokenEndpoint = &endpoint
-	} else {
-		defaultEndpoint := "/api/wstoken"
-		c.TokenEndpoint = &defaultEndpoint
 	}
+	// If no token endpoint is set, use direct API key authentication (TokenEndpoint remains nil)
 
 	if wsEndpoint := os.Getenv("VOCALS_WS_ENDPOINT"); wsEndpoint != "" {
 		c.WsEndpoint = &wsEndpoint
 	} else {
-		defaultWs := "ws://192.168.1.46:8000/v1/stream/conversation"
+		// Use the production Vocals API endpoint
+		defaultWs := "wss://api.vocals.dev/v1/stream/conversation"
 		c.WsEndpoint = &defaultWs
 	}
 

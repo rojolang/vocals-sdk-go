@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	VOCALS_WS_ENDPOINT = "ws://192.168.1.46:8000/v1/stream/conversation"
+	VOCALS_WS_ENDPOINT = "wss://api.vocals.dev/v1/stream/conversation"
 	TOKEN_EXPIRY_MS    = 10 * 60 * 1000
 	API_KEY_MIN_LENGTH = 32
 )

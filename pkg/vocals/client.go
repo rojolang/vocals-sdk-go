@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"math"
 	"sync"
 	"time"
@@ -52,7 +53,6 @@ func NewVocalsClient(config *VocalsConfig, audioConfig *AudioConfig, userID *str
 		audioDataHandlers:  []AudioDataHandler{},
 		ctx:                ctx,
 		cancel:             cancel,
-		logger:             GetGlobalLogger().WithComponent("VocalsClient"),
 	}
 
 	client.setupInternalHandlers()
@@ -64,7 +64,7 @@ func NewVocalsClient(config *VocalsConfig, audioConfig *AudioConfig, userID *str
 	if config.AutoConnect {
 		go func() {
 			if err := client.Connect(); err != nil {
-				client.logger.WithError(err).Error("Auto-connect failed")
+				log.Printf("Auto-connect failed: %v", err)
 			}
 		}()
 	}
@@ -82,10 +82,7 @@ func (c *VocalsClient) setupInternalHandlers() {
 				audioData := getString(data, "audio_data")
 
 				if segmentID == "" || audioData == "" {
-					c.logger.WithFields(map[string]interface{}{
-						"segment_id": segmentID,
-						"audio_data_empty": audioData == "",
-					}).Error("Invalid TTS message: missing required fields")
+					log.Printf("Invalid TTS message: missing required fields (segment_id: %s, audio_data: %s)", segmentID, audioData)
 					return
 				}
 
@@ -99,7 +96,7 @@ func (c *VocalsClient) setupInternalHandlers() {
 				}
 				c.audioProcessor.AddToQueue(segment)
 			} else {
-				c.logger.WithField("data_type", fmt.Sprintf("%T", msg.Data)).Error("Invalid TTS message format: expected map[string]interface{}")
+				log.Printf("Invalid TTS message format: expected map[string]interface{}, got %T", msg.Data)
 			}
 		}
 		// Handle other types internally
@@ -125,8 +122,55 @@ func (c *VocalsClient) Disconnect() {
 	c.websocketClient.Disconnect()
 }
 
+// EnsureConnected ensures the WebSocket connection is established before proceeding
+func (c *VocalsClient) EnsureConnected() error {
+	if c.websocketClient.IsConnected() {
+		log.Printf("Already connected (state: %v)", c.websocketClient.GetState())
+		return nil
+	}
+	
+	log.Printf("Connection state: %v - attempting to connect...", c.websocketClient.GetState())
+	
+	// Try to connect
+	if err := c.Connect(); err != nil {
+		return fmt.Errorf("connection failed: %v", err)
+	}
+	
+	// Wait for connection to be established (with timeout)
+	timeout := time.NewTimer(10 * time.Second)
+	defer timeout.Stop()
+	
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-timeout.C:
+			return fmt.Errorf("connection timeout after 10 seconds (state: %v)", c.websocketClient.GetState())
+		case <-ticker.C:
+			if c.websocketClient.IsConnected() {
+				log.Printf("Successfully connected (state: %v)", c.websocketClient.GetState())
+				return nil
+			}
+			state := c.websocketClient.GetState()
+			if state == ErrorState {
+				return fmt.Errorf("connection failed - WebSocket in error state")
+			}
+			log.Printf("Waiting for connection... (state: %v)", state)
+		}
+	}
+}
+
 func (c *VocalsClient) StartRecording() error {
 	return c.audioProcessor.StartRecording(func(data []float32) {
+		// Check if we're connected before trying to send data
+		if !c.websocketClient.IsConnected() {
+			if c.config.DebugWebsocket {
+				log.Printf("Skipping audio data - not connected (state: %v)", c.websocketClient.GetState())
+			}
+			return
+		}
+
 		// Send to websocket as base64
 		buf := new(bytes.Buffer)
 		for _, sample := range data {
@@ -144,7 +188,7 @@ func (c *VocalsClient) StartRecording() error {
 		}
 		err := c.websocketClient.SendMessage(msg)
 		if err != nil {
-			c.logger.WithError(err).Error("Error sending audio data")
+			log.Printf("Error sending audio data: %v", err)
 			return
 		}
 	})
@@ -155,6 +199,11 @@ func (c *VocalsClient) StopRecording() error {
 }
 
 func (c *VocalsClient) StreamMicrophone(duration float64) error {
+	// Ensure we're connected before starting
+	if err := c.EnsureConnected(); err != nil {
+		return fmt.Errorf("failed to establish connection: %v", err)
+	}
+	
 	if err := c.StartRecording(); err != nil {
 		return err
 	}
@@ -303,30 +352,27 @@ func (c *VocalsClient) StreamMicrophoneWithStats(
 
 // StreamMicrophoneWithBasicStats provides enhanced streaming with basic statistics and logging
 func (c *VocalsClient) StreamMicrophoneWithBasicStats(duration float64, silenceThreshold float32, verbose bool) (*StreamStats, error) {
+	// Ensure we're connected before starting
+	if err := c.EnsureConnected(); err != nil {
+		return nil, fmt.Errorf("failed to establish connection: %v", err)
+	}
+	
 	var statsCallback StreamStatsCallback
 	var audioLevelCallback AudioLevelCallback
 	var silenceDetectionCallback SilenceDetectionCallback
 
 	if verbose {
 		statsCallback = func(stats *StreamStats) {
-			c.logger.WithFields(map[string]interface{}{
-				"duration": stats.Duration.Seconds(),
-				"samples": stats.TotalSamples,
-				"avg_amplitude": stats.AverageAmplitude,
-				"max_amplitude": stats.MaxAmplitude,
-				"voice_activity": stats.VoiceActivityRatio * 100,
-			}).Info("Stream statistics update")
+			log.Printf("Stream Stats: Duration=%.2fs, Samples=%d, AvgAmp=%.4f, MaxAmp=%.4f, VoiceActivity=%.2f%%",
+				stats.Duration.Seconds(), stats.TotalSamples, stats.AverageAmplitude, stats.MaxAmplitude, stats.VoiceActivityRatio*100)
 		}
 
 		audioLevelCallback = func(avgLevel, maxLevel float32) {
-			c.logger.WithFields(map[string]interface{}{
-				"avg_level": avgLevel,
-				"max_level": maxLevel,
-			}).Debug("Audio level update")
+			log.Printf("Audio Level: Avg=%.4f, Max=%.4f", avgLevel, maxLevel)
 		}
 
 		silenceDetectionCallback = func(duration time.Duration) {
-			c.logger.WithField("silence_duration", duration).Debug("Silence detected")
+			log.Printf("Silence detected for: %v", duration)
 		}
 	}
 
@@ -341,6 +387,11 @@ func (c *VocalsClient) StreamAudioFile(filePath string) error {
 
 	chunkSize := c.audioConfig.BufferSize
 	for i := 0; i < len(samples); i += chunkSize {
+		// Check if we're still connected
+		if !c.websocketClient.IsConnected() {
+			return fmt.Errorf("connection lost during streaming")
+		}
+
 		end := i + chunkSize
 		if end > len(samples) {
 			end = len(samples)
@@ -362,7 +413,11 @@ func (c *VocalsClient) StreamAudioFile(filePath string) error {
 				"format":      c.audioConfig.Format,
 			},
 		}
-		c.websocketClient.SendMessage(msg)
+		
+		err := c.websocketClient.SendMessage(msg)
+		if err != nil {
+			return fmt.Errorf("failed to send audio data: %v", err)
+		}
 
 		// Sleep to simulate real-time playback
 		sleepDuration := time.Duration(float64(len(chunk))/float64(c.audioConfig.SampleRate)*1000) * time.Millisecond
@@ -407,7 +462,7 @@ func (c *VocalsClient) Cleanup() {
 	c.cancel()
 	c.audioProcessor.Cleanup()
 	c.websocketClient.Disconnect()
-	c.logger.Info("Vocals client cleaned up")
+	log.Println("Vocals client cleaned up")
 }
 
 func (c *VocalsClient) SendMessage(msg *WebSocketMessage) error {
@@ -452,10 +507,7 @@ func getString(data map[string]interface{}, key string) string {
 		if str, ok := val.(string); ok {
 			return str
 		}
-		GetGlobalLogger().WithFields(map[string]interface{}{
-			"key": key,
-			"type": fmt.Sprintf("%T", val),
-		}).Warn("Type assertion failed for key: expected string")
+		log.Printf("Type assertion failed for key '%s': expected string, got %T", key, val)
 	}
 	return ""
 }
@@ -468,10 +520,7 @@ func getInt(data map[string]interface{}, key string) int {
 		if num, ok := val.(int); ok {
 			return num
 		}
-		GetGlobalLogger().WithFields(map[string]interface{}{
-			"key": key,
-			"type": fmt.Sprintf("%T", val),
-		}).Warn("Type assertion failed for key: expected int or float64")
+		log.Printf("Type assertion failed for key '%s': expected int or float64, got %T", key, val)
 	}
 	return 0
 }
@@ -484,10 +533,7 @@ func getFloat64(data map[string]interface{}, key string) float64 {
 		if num, ok := val.(int); ok {
 			return float64(num)
 		}
-		GetGlobalLogger().WithFields(map[string]interface{}{
-			"key": key,
-			"type": fmt.Sprintf("%T", val),
-		}).Warn("Type assertion failed for key: expected float64 or int")
+		log.Printf("Type assertion failed for key '%s': expected float64 or int, got %T", key, val)
 	}
 	return 0.0
 }
@@ -498,10 +544,7 @@ func getBool(data map[string]interface{}, key string) bool {
 		if b, ok := val.(bool); ok {
 			return b
 		}
-		GetGlobalLogger().WithFields(map[string]interface{}{
-			"key": key,
-			"type": fmt.Sprintf("%T", val),
-		}).Warn("Type assertion failed for key: expected bool")
+		log.Printf("Type assertion failed for key '%s': expected bool, got %T", key, val)
 	}
 	return false
 }
