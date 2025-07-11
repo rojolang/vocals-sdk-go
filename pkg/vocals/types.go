@@ -157,12 +157,10 @@ type SpeechInterruptionData struct {
 
 // WebSocketMessage struct
 type WebSocketMessage struct {
-	Event string
-
-	Data       any
-	Format     *string
-	SampleRate *int
-	msg        *string
+	Event      string      `json:"event"`
+	Data       interface{} `json:"data"`
+	Format     *string     `json:"format,omitempty"`
+	SampleRate *int        `json:"sampleRate,omitempty"`
 }
 
 // WebSocketResponse struct

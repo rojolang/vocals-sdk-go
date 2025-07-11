@@ -187,15 +187,31 @@ func GetTokenTimeLeft(token *WSToken) time.Duration {
 
 // Message creation helpers
 func CreateAudioMessage(audioData []float32, sampleRate int, format string) *WebSocketMessage {
-	encoded := EncodeAudioToBase64(audioData)
-	return &WebSocketMessage{
-		Event: "audio_data",
-		Data: map[string]interface{}{
-			"audio":       encoded,
-			"sample_rate": sampleRate,
-			"format":      format,
-		},
+	// Convert float32 samples to raw bytes
+	buf := new(bytes.Buffer)
+	for _, sample := range audioData {
+		bits := math.Float32bits(sample)
+		binary.Write(buf, binary.LittleEndian, bits)
 	}
+	
+	sampleRatePtr := &sampleRate
+	formatPtr := &format
+	return &WebSocketMessage{
+		Event:      "media",
+		Data:       buf.Bytes(),  // Raw []byte - JSON marshaler will auto-base64 it
+		Format:     formatPtr,
+		SampleRate: sampleRatePtr,
+	}
+}
+
+// CreateRawAudioBytes converts float32 samples to raw PCM bytes
+func CreateRawAudioBytes(audioData []float32) []byte {
+	buf := new(bytes.Buffer)
+	for _, sample := range audioData {
+		bits := math.Float32bits(sample)
+		binary.Write(buf, binary.LittleEndian, bits)
+	}
+	return buf.Bytes()
 }
 
 func CreateTextMessage(text string) *WebSocketMessage {

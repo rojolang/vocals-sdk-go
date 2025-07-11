@@ -3,7 +3,6 @@ package vocals
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"log"
@@ -150,6 +149,12 @@ func (c *VocalsClient) EnsureConnected() error {
 		case <-ticker.C:
 			if c.websocketClient.IsConnected() {
 				log.Printf("Successfully connected (state: %v)", c.websocketClient.GetState())
+				
+				// Send settings event after connection is established
+				if err := c.sendSettingsEvent(); err != nil {
+					log.Printf("Failed to send settings event: %v", err)
+				}
+				
 				return nil
 			}
 			state := c.websocketClient.GetState()
@@ -159,6 +164,23 @@ func (c *VocalsClient) EnsureConnected() error {
 			log.Printf("Waiting for connection... (state: %v)", state)
 		}
 	}
+}
+
+// sendSettingsEvent sends the audio settings to the server
+func (c *VocalsClient) sendSettingsEvent() error {
+	settingsMsg := &WebSocketMessage{
+		Event: "settings",
+		Data: map[string]interface{}{
+			"format":     c.audioConfig.Format,
+			"sampleRate": c.audioConfig.SampleRate,
+			"channels":   c.audioConfig.Channels,
+		},
+	}
+	
+	log.Printf("Sending settings event: format=%s, sampleRate=%d, channels=%d", 
+		c.audioConfig.Format, c.audioConfig.SampleRate, c.audioConfig.Channels)
+	
+	return c.websocketClient.SendMessage(settingsMsg)
 }
 
 func (c *VocalsClient) StartRecording() error {
@@ -171,20 +193,21 @@ func (c *VocalsClient) StartRecording() error {
 			return
 		}
 
-		// Send to websocket as base64
+		// Convert PCM float32 to raw bytes
 		buf := new(bytes.Buffer)
 		for _, sample := range data {
 			bits := math.Float32bits(sample)
 			binary.Write(buf, binary.LittleEndian, bits)
 		}
-		encoded := base64.StdEncoding.EncodeToString(buf.Bytes())
+		
+		// Send as JSON with raw bytes - Go's JSON marshaler will auto-base64 it
+		format := c.audioConfig.Format
+		sampleRate := c.audioConfig.SampleRate
 		msg := &WebSocketMessage{
-			Event: "audio_data",
-			Data: map[string]interface{}{
-				"audio":       encoded,
-				"sample_rate": c.audioConfig.SampleRate,
-				"format":      c.audioConfig.Format,
-			},
+			Event:      "media",
+			Data:       buf.Bytes(),  // Raw []byte - JSON marshaler will auto-base64 it
+			Format:     &format,
+			SampleRate: &sampleRate,
 		}
 		err := c.websocketClient.SendMessage(msg)
 		if err != nil {
@@ -398,22 +421,22 @@ func (c *VocalsClient) StreamAudioFile(filePath string) error {
 		}
 		chunk := samples[i:end]
 
-		// Encode and send
+		// Convert chunk to raw bytes
 		buf := new(bytes.Buffer)
 		for _, sample := range chunk {
 			bits := math.Float32bits(sample)
 			binary.Write(buf, binary.LittleEndian, bits)
 		}
-		encoded := base64.StdEncoding.EncodeToString(buf.Bytes())
-		msg := &WebSocketMessage{
-			Event: "audio_data",
-			Data: map[string]interface{}{
-				"audio":       encoded,
-				"sample_rate": c.audioConfig.SampleRate,
-				"format":      c.audioConfig.Format,
-			},
-		}
 		
+		// Send as JSON with raw bytes - Go's JSON marshaler will auto-base64 it
+		format := c.audioConfig.Format
+		sampleRate := c.audioConfig.SampleRate
+		msg := &WebSocketMessage{
+			Event:      "media",
+			Data:       buf.Bytes(),  // Raw []byte - JSON marshaler will auto-base64 it
+			Format:     &format,
+			SampleRate: &sampleRate,
+		}
 		err := c.websocketClient.SendMessage(msg)
 		if err != nil {
 			return fmt.Errorf("failed to send audio data: %v", err)

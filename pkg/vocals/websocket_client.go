@@ -132,6 +132,20 @@ func (wsc *WebSocketClient) performConnection() error {
 	}
 
 	wsc.conn = conn
+	
+	// Send start event immediately after connection
+	if wsc.config.DebugWebsocket {
+		log.Printf("Sending start event after connection")
+	}
+	startMsg := &WebSocketMessage{
+		Event: "start",
+		Data:  map[string]interface{}{},
+	}
+	if err := wsc.conn.WriteJSON(startMsg); err != nil {
+		wsc.conn.Close()
+		return fmt.Errorf("failed to send start event: %v", err)
+	}
+	
 	return nil
 }
 
@@ -204,11 +218,42 @@ func (wsc *WebSocketClient) SendMessage(message *WebSocketMessage) error {
 	return wsc.conn.WriteJSON(message)
 }
 
+// SendBinaryMessage sends raw binary data over WebSocket
+func (wsc *WebSocketClient) SendBinaryMessage(data []byte) error {
+	wsc.mu.Lock()
+	defer wsc.mu.Unlock()
+
+	if wsc.state != Connected {
+		return fmt.Errorf("not connected")
+	}
+
+	if wsc.config.DebugWebsocket {
+		log.Printf("Sending binary message: %d bytes", len(data))
+	}
+
+	return wsc.conn.WriteMessage(websocket.BinaryMessage, data)
+}
+
 func (wsc *WebSocketClient) Disconnect() {
 	wsc.mu.Lock()
 	defer wsc.mu.Unlock()
 
 	wsc.shouldReconnect = false
+	
+	// Send stop event before disconnecting
+	if wsc.conn != nil && wsc.state == Connected {
+		if wsc.config.DebugWebsocket {
+			log.Printf("Sending stop event before disconnect")
+		}
+		stopMsg := &WebSocketMessage{
+			Event: "stop",
+			Data:  map[string]interface{}{},
+		}
+		if err := wsc.conn.WriteJSON(stopMsg); err != nil && wsc.config.DebugWebsocket {
+			log.Printf("Failed to send stop event: %v", err)
+		}
+	}
+	
 	wsc.cancel()
 
 	if wsc.conn != nil {

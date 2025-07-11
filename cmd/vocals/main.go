@@ -48,8 +48,8 @@ func demoCmd() *cobra.Command {
 	}
 
 	cmd.AddCommand(demoRecordCmd())
-	cmd.AddCommand(demoStatsCmd())
 	cmd.AddCommand(demoPlaybackCmd())
+	cmd.AddCommand(demoStatsCmd())
 
 	return cmd
 }
@@ -106,23 +106,34 @@ func demoRecordCmd() *cobra.Command {
 	return cmd
 }
 
+
 func demoStatsCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "stats",
 		Short: "Demo audio recording with statistics",
-		Long:  "Record audio with comprehensive statistics and monitoring",
+		Long:  "Record audio from the microphone with enhanced statistics and debugging",
 		Run: func(cmd *cobra.Command, args []string) {
 			if duration == 0 {
-				duration = 10.0 // Default 10 seconds for stats demo
+				duration = 5.0 // Default 5 seconds
 			}
+
+			// Load environment variables
+			_ = godotenv.Load()
 
 			config := vocals.NewVocalsConfig()
 			audioConfig := vocals.NewAudioConfig()
 			
-			// Enable WebSocket debugging for better troubleshooting
-			config.DebugWebsocket = true
+			// Disable verbose WebSocket debugging for cleaner output
+			config.DebugWebsocket = false
+			
+			// Set API key from env if not provided via flag
+			if apiKey == "" {
+				apiKey = os.Getenv("VOCALS_DEV_API_KEY")
+			}
 			
 			if apiKey != "" {
+				// Set API key in the vocals module
+				os.Setenv("VOCALS_DEV_API_KEY", apiKey)
 				vocals.GetGlobalLogger().WithField("api_key_prefix", apiKey[:min(len(apiKey), 8)]).Info("Using API key")
 			}
 			
@@ -135,32 +146,124 @@ func demoStatsCmd() *cobra.Command {
 				userIDPtr = &userID
 			}
 
+			// Disable verbose WebSocket debugging
+			config.DebugWebsocket = false
+			config.AutoConnect = false // We'll connect manually to track the process
+
 			client := vocals.NewVocalsClient(config, audioConfig, userIDPtr, []string{})
-
-			fmt.Printf("Recording with stats for %.1f seconds...\n", duration)
 			
-			stats, err := client.StreamMicrophoneWithBasicStats(duration, 0.01, verbose)
-			if err != nil {
-				vocals.GetGlobalLogger().WithError(err).Fatal("Stats recording failed")
-			}
+			// Add comprehensive handlers
+			client.AddMessageHandler(func(msg *vocals.WebSocketResponse) {
+				// Only show meaningful responses, not status messages
+				if msg.Type == nil || *msg.Type == "status" {
+					return
+				}
+				
+				msgType := *msg.Type
+				data, ok := msg.Data.(map[string]interface{})
+				if !ok {
+					fmt.Printf("\n[%s] %v\n", msgType, msg.Data)
+					return
+				}
+				
+				// Handle different message types with clean formatting
+				switch msgType {
+				case "transcription":
+					text := getString(data, "text")
+					isPartial := getBool(data, "is_partial")
+					segmentID := getString(data, "segment_id")
+					
+					if isPartial {
+						fmt.Printf("\r[TRANSCRIPTION] (partial): %s", text)
+					} else {
+						fmt.Printf("\n[TRANSCRIPTION] %s (segment: %s)\n", text, segmentID)
+					}
+					
+				case "llm_response_streaming":
+					token := getString(data, "token")
+					isComplete := getBool(data, "is_complete")
+					segmentID := getString(data, "segment_id")
+					
+					if !isComplete {
+						// For streaming, just print the token without newline
+						fmt.Printf("%s", token)
+					} else {
+						// Complete response, add newline and segment info
+						fmt.Printf("\n[LLM COMPLETE] (segment: %s)\n", segmentID)
+					}
+					
+				case "tts_audio":
+					text := getString(data, "text")
+					audioData := getString(data, "audio_data")
+					sampleRate := getInt(data, "sample_rate")
+					segmentID := getString(data, "segment_id")
+					duration := getFloat64(data, "duration_seconds")
+					
+					audioSize := len(audioData)
+					fmt.Printf("\n[TTS AUDIO] \"%s\"\n", text)
+					fmt.Printf("  → Audio: %d bytes, %.1fs @ %dHz (segment: %s)\n", 
+						audioSize, duration, sampleRate, segmentID)
+					
+				case "speech_interruption":
+					fmt.Printf("\n[INTERRUPTION] Speech detected - stopping current response\n")
+					
+				default:
+					// For any other message types, show a clean summary
+					fmt.Printf("\n[%s]\n", msgType)
+					for key, value := range data {
+						// Special handling for audio data - don't print the full base64
+						if key == "audio_data" || key == "data" {
+							if str, ok := value.(string); ok && len(str) > 100 {
+								fmt.Printf("  %s: [%d bytes]\n", key, len(str))
+								continue
+							}
+						}
+						fmt.Printf("  %s: %v\n", key, value)
+					}
+				}
+			})
+			
+			client.AddConnectionHandler(func(state vocals.ConnectionState) {
+				fmt.Printf("[CONNECTION] State changed to: %s\n", state)
+			})
+			
+			client.AddErrorHandler(func(err *vocals.VocalsError) {
+				fmt.Printf("[ERROR] %s: %s\n", err.Code, err.Message)
+			})
 
-			// Display final statistics
-			fmt.Printf("\n=== Recording Statistics ===\n")
-			fmt.Printf("Duration: %v\n", stats.Duration)
+			fmt.Println("=== Starting Enhanced Recording Demo ===")
+			fmt.Printf("Duration: %.1f seconds\n", duration)
+			fmt.Printf("Sample Rate: %d Hz\n", audioConfig.SampleRate)
+			fmt.Printf("Format: %s\n", audioConfig.Format)
+			fmt.Printf("Channels: %d\n", audioConfig.Channels)
+			fmt.Println("=====================================")
+			
+			// Use the enhanced stats method
+			stats, err := client.StreamMicrophoneWithBasicStats(duration, 0.001, true)
+			if err != nil {
+				vocals.GetGlobalLogger().WithError(err).Fatal("Recording failed")
+			}
+			
+			// Print final statistics
+			fmt.Println("\n=== Final Statistics ===")
+			fmt.Printf("Total Duration: %.2fs\n", stats.Duration.Seconds())
 			fmt.Printf("Total Samples: %d\n", stats.TotalSamples)
 			fmt.Printf("Total Bytes: %d\n", stats.TotalBytes)
 			fmt.Printf("Average Amplitude: %.4f\n", stats.AverageAmplitude)
 			fmt.Printf("Max Amplitude: %.4f\n", stats.MaxAmplitude)
+			fmt.Printf("Min Amplitude: %.4f\n", stats.MinAmplitude)
 			fmt.Printf("RMS Amplitude: %.4f\n", stats.RMSAmplitude)
-			fmt.Printf("Voice Activity: %.1f%%\n", stats.GetVoiceActivityPercentage())
+			fmt.Printf("Voice Activity: %.2f%%\n", stats.GetVoiceActivityPercentage())
+			fmt.Printf("Silence: %.2f%%\n", stats.GetSilencePercentage())
 			fmt.Printf("Quality Score: %.2f\n", stats.GetQualityScore())
-			fmt.Printf("Healthy: %v\n", stats.IsHealthy())
-
+			fmt.Printf("Is Healthy: %v\n", stats.IsHealthy())
+			fmt.Println("=======================")
+			
 			client.Cleanup()
 		},
 	}
 
-	cmd.Flags().Float64VarP(&duration, "duration", "d", 10.0, "Recording duration in seconds")
+	cmd.Flags().Float64VarP(&duration, "duration", "d", 5.0, "Recording duration in seconds")
 	return cmd
 }
 
@@ -463,4 +566,50 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// Helper functions for safe type extraction from map[string]interface{}
+func getString(data map[string]interface{}, key string) string {
+	if val, ok := data[key]; ok {
+		if str, ok := val.(string); ok {
+			return str
+		}
+	}
+	return ""
+}
+
+func getBool(data map[string]interface{}, key string) bool {
+	if val, ok := data[key]; ok {
+		if b, ok := val.(bool); ok {
+			return b
+		}
+	}
+	return false
+}
+
+func getInt(data map[string]interface{}, key string) int {
+	if val, ok := data[key]; ok {
+		if num, ok := val.(float64); ok {
+			return int(num)
+		}
+		if num, ok := val.(int); ok {
+			return num
+		}
+	}
+	return 0
+}
+
+func getFloat64(data map[string]interface{}, key string) float64 {
+	if val, ok := data[key]; ok {
+		if num, ok := val.(float64); ok {
+			return num
+		}
+		if num, ok := val.(int); ok {
+			return float64(num)
+		}
+		if num, ok := val.(float32); ok {
+			return float64(num)
+		}
+	}
+	return 0.0
 }
